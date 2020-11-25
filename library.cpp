@@ -338,178 +338,6 @@ List bin_logit_cr(vec &fail, mat &Z, IntegerVector &n_prov, vec &time,
 }
 
 // [[Rcpp::export]]
-List bin_logit_cr_zeroeta(vec &fail, mat &Z, IntegerVector &n_prov, vec &time,
-                          vec gamma, vec eta, vec beta, 
-                          int parallel=1, int threads=1,
-                          double s=0.01, double t=0.6, 
-                          double tol=1e-8, int max_iter=100, double bound=10.0,
-                          double alpha=0.05) {
-  
-  unsigned int m = gamma.n_elem, n = Z.n_rows; // prov/sample count
-  unsigned int p = beta.n_elem, tau = eta.n_elem; // covar/time count
-  eta.zeros();
-  IntegerVector cumsum_prov = cumsum(n_prov);
-  cumsum_prov.push_front(0);
-  vec uniqtime = unique(time), obs_time(tau+1); // count by time
-  vector<uvec> idx_time; // index of disc stratified by time
-  for (unsigned int i = 0; i <= tau; i++) {
-    uvec idx_tmp = find(time == uniqtime(i));
-    idx_time.push_back(idx_tmp);
-    obs_time(i) = accu(fail.elem(idx_tmp));
-  }
-  vec obs_prov(m); // failure count by provider
-  for (unsigned int i = 0; i < m; i++) {
-    unsigned int start = cumsum_prov[i]; 
-    unsigned int   end = cumsum_prov[i+1]-1;
-    obs_prov(i) = accu(fail.subvec(start, end));
-  }
-  double d_obj, v, inc, crit = 100.0;
-  double obj = Loglkd_logit(fail, Z, cumsum_prov, idx_time, 
-                            gamma, eta, beta);// initialize objetive function
-  int iter = 0, btr_max = 1000, btr_ct = 0;
-  cout << "Implementing BIN (logit) ..." << endl;
-  while (iter < max_iter && crit >= tol) {
-    iter++;
-    // calculating scores and info matrices
-    vec tmp = gamma_provtodis(gamma, cumsum_prov) + Z * beta;
-    // sum of p_{ij}(k) or q_{ij}(k) over k for each dis
-    vec psum = 1 / (1 + exp(-tmp)); // initialized at time k = 1
-    vec qsum = psum % (1 - psum); // initialized at time k = 1
-    vec score_eta(tau, fill::zeros), info_eta(tau, fill::zeros);
-    mat info_beta_eta(p, tau, fill::zeros);
-    mat tmpmat(n, tau, fill::zeros); // tmpmat to info_eta_gamma
-    for (unsigned int i = 1; i <= tau; i++) {
-      score_eta(i-1) += obs_time(i);
-      mat Z_tmp = Z.rows(idx_time[i]); 
-      for (unsigned int k = 0; k < i; k++) { // at risk
-        vec p_tmp = 1 / (1+exp(-eta(k)-tmp.elem(idx_time[i])));
-        vec q_tmp = p_tmp % (1 - p_tmp);
-        psum.elem(idx_time[i]) += p_tmp;
-        qsum.elem(idx_time[i]) += q_tmp;
-        score_eta(k) -= accu(p_tmp);
-        info_eta(k) += accu(q_tmp);
-        uvec col_tmpmat(1); col_tmpmat.fill(k);
-        tmpmat.submat(idx_time[i], col_tmpmat) += q_tmp;
-        info_beta_eta.col(k) += sum(Z_tmp.each_col() % q_tmp).t();
-        // note: a non-contiguous submatrix doesn't have each_col as 
-        //       its member function
-      }
-    }
-    mat Z_sum = Z.each_col() % psum; // Z % psum
-    vec score_beta = sum(Z.rows(find(fail==1))).t() - sum(Z_sum).t();
-    Z_sum = Z.each_col() % qsum; // Z % qsum
-    mat info_beta = Z.t() * Z_sum;
-    vec score_gamma(m), info_gamma_inv(m);
-    mat info_eta_gamma(tau, m), info_beta_gamma(p, m);
-    for (unsigned int i = 0; i < m; i++) {
-      unsigned int start = cumsum_prov[i]; 
-      unsigned int   end = cumsum_prov[i+1]-1;
-      score_gamma(i) = obs_prov(i) - accu(psum.subvec(start, end));
-      info_gamma_inv(i) = 1 / accu(qsum.subvec(start, end));
-      info_eta_gamma.col(i) = sum(tmpmat.rows(start, end)).t();
-      info_beta_gamma.col(i) = sum(Z_sum.rows(start, end)).t();
-    }
-    info_eta_gamma.zeros(); info_eta.zeros(); info_beta_eta.zeros();
-    score_eta.zeros();
-    // Newton step
-    mat info_1 = info_beta_gamma.each_row()%info_gamma_inv.t();
-    mat schur_inv = inv_sympd(info_beta - info_beta_gamma*info_1.t());
-    mat info_2 = schur_inv * info_1;
-    vec d_gamma = info_gamma_inv % score_gamma + 
-      info_2.t()*(info_1*score_gamma-score_beta);
-    vec d_beta = schur_inv*score_beta - info_2*score_gamma;
-    // backtracking line search
-    v = 1.0; // initial step size
-    d_obj = Loglkd_logit(fail, Z, cumsum_prov, idx_time, 
-                         gamma+v*d_gamma, eta, beta+v*d_beta) - obj;
-    inc = dot(score_gamma, d_gamma) + dot(score_beta, d_beta); // square of Newton increment
-    int btr_ct_iter = 0, btr_max_iter = 50;
-    while (d_obj < s*v*inc && btr_ct < btr_max && btr_ct_iter < btr_max_iter) {
-      ++btr_ct;
-      ++btr_ct_iter;
-      v *= t;
-      d_obj = Loglkd_logit(fail, Z, cumsum_prov, idx_time, 
-                           gamma+v*d_gamma, eta, beta+v*d_beta) - obj;
-    }
-    gamma += v * d_gamma;
-    double med_gamma = median(gamma);
-    gamma = clamp(gamma, med_gamma-bound, med_gamma+bound);
-    beta += v * d_beta;
-    obj += d_obj;
-    
-    crit = v * norm(d_beta, "inf");
-    cout << "Iter " << iter << ": loglkd = " << scientific
-         << setprecision(5) << obj << ";";
-    cout << " running diff = " << scientific
-         << setprecision(5) << crit << ";" << endl;
-  }
-  cout << "BIN converged after " << iter << " iterations!" << endl;
-  // SRR and indep score test
-  vec tmp = gamma_provtodis(median(gamma)*ones(m), cumsum_prov) + Z*beta;
-  vec tmp_pred = gamma_provtodis(gamma, cumsum_prov) + Z*beta;
-  vec hazsum = 1 / (1 + exp(-tmp)); // initialized at time k = 1
-  vec hazsum_pred = 1 / (1 + exp(-tmp_pred));
-  vec qsum = hazsum % (1 - hazsum); // initialized at time k = 1
-  vec qsum_pred = hazsum_pred % (1 - hazsum_pred);
-  // mat exact_tmpmat(n, tau+1, fill::zeros); // exact test
-  // exact_tmpmat.col(0) += hazsum;
-  for (unsigned int i = 1; i <= tau; i++) {
-    for (unsigned int k = 0; k < i; k++) { // at risk
-      vec haz_tmp = 1 / (1+exp(-eta(k)-tmp.elem(idx_time[i])));
-      vec haz_tmp_pred = 1 / (1+exp(-eta(k)-tmp_pred.elem(idx_time[i])));
-      hazsum.elem(idx_time[i]) += haz_tmp;
-      hazsum_pred.elem(idx_time[i]) += haz_tmp_pred;
-      qsum.elem(idx_time[i]) += haz_tmp % (1 - haz_tmp);
-      qsum_pred.elem(idx_time[i]) += haz_tmp_pred % (1 - haz_tmp_pred);
-      // uvec col_tmpmat(1); col_tmpmat.fill(k+1);
-      // exact_tmpmat.submat(idx_time[i], col_tmpmat) += haz_tmp;
-    }
-  }
-  vec exp_prov(m), pred_prov(m); // expected readmin
-  vec scorestat_prov(m), scoreflag_prov(m), scorepval_prov(m); // score
-  // vec exactpval_prov(m), exactflag_prov(m); // exact test p-values/flags
-  // // load package poibin
-  // Environment poibin = Environment::namespace_env("poibin");
-  // Function ppoibin = poibin["ppoibin"], dpoibin = poibin["dpoibin"];
-  
-  for (unsigned int i = 0; i < m; i++) {
-    unsigned int start = cumsum_prov[i]; 
-    unsigned int   end = cumsum_prov[i+1]-1;
-    // exp readmin
-    exp_prov(i) = accu(hazsum.subvec(start, end));
-    // pred readmin
-    pred_prov(i) = accu(hazsum_pred.subvec(start, end));
-    // score test
-    scorestat_prov(i) = (obs_prov(i) - exp_prov(i))
-      / sqrt(accu(qsum.subvec(start, end)));
-    double prob = 1-normcdf(scorestat_prov(i)); // score test upper tail
-    scoreflag_prov(i) =
-      ifelse_scalar(prob<alpha/2, 1, ifelse_scalar(prob<=1-alpha/2, 0, -1));
-    scorepval_prov(i) = 2*min(prob, 1-prob);
-    // // exact test
-    // vec probs = nonzeros(exact_tmpmat.rows(start, end));
-    // prob =  // exact test upper tail
-    //   1 - as<double>(ppoibin(obs_prov(i), probs, "DFT-CF", R_NilValue))
-    //   + 0.5*as<double>(dpoibin(obs_prov(i), probs, R_NilValue));
-    // exactflag_prov(i) =
-    //   ifelse_scalar(prob<alpha/2, 1, ifelse_scalar(prob<=1-alpha/2, 0, -1));
-    // exactpval_prov(i) = 2*min(prob, 1-prob);  
-  }
-  
-  List ret = List::create(_["gamma"]=gamma, 
-                          _["eta"]=eta, _["beta"]=beta,
-                          _["Obs"]=obs_prov, _["Exp"]=exp_prov,
-                          _["Pred"]=pred_prov,
-                          _["SRR"]=obs_prov/exp_prov,
-                          _["score.stat"]=scorestat_prov,
-                          _["score.flag"]=scoreflag_prov,
-                          _["score.pval"]=scorepval_prov);
-  // _["exact.flag"]=exactflag_prov,
-  // _["exact.pval"]=exactpval_prov
-  return ret;
-}
-
-// [[Rcpp::export]]
 List bin_logit_cr_cstr(vec &fail, mat &Z, IntegerVector &n_prov, vec &time, 
                        vec gamma, vec eta, vec beta, 
                        unsigned int idx_gamma, double cstr_gamma,
@@ -877,7 +705,7 @@ NumericVector bin_logit_cr_score(vec &fail, mat &Z, IntegerVector &n_prov,
       }
       mat Z_pat = Z_tmp.rows(start_pat, end_pat);
       mat mat_beta_stra(p, end_tmp+1, fill::zeros),
-          mat_beta_r(end_tmp+1, p, fill::zeros), 
+      mat_beta_r(end_tmp+1, p, fill::zeros), 
       mat_beta(p, end_tmp+1, fill::zeros);
       for (unsigned int k = 0; k <= end_pat-start_pat; k++) {
         mat_beta += Z_pat.row(k).t() *
@@ -922,7 +750,7 @@ NumericVector bin_logit_cr_score(vec &fail, mat &Z, IntegerVector &n_prov,
       join_cols(bread_eta_gamma,bread_beta_gamma)*bread_1.t());
   mat bread_2 = schur_inv * bread_1;
   rowvec b_inv_idx1 = bread_1.col(idx_gamma).t() * bread_2, 
-         b_inv_idx2 = bread_2.col(idx_gamma).t(); // all but a minus sign
+    b_inv_idx2 = bread_2.col(idx_gamma).t(); // all but a minus sign
   b_inv_idx1(idx_gamma) += bread_gamma_inv(idx_gamma);
   // standard error
   double se_str =
@@ -961,7 +789,7 @@ NumericVector bin_logit_cr_score(vec &fail, mat &Z, IntegerVector &n_prov,
   double prob_am = 1-normcdf(stat_am);
   // flagging
   double flag_str = ifelse_scalar(prob_str < alpha/2, 1,
-                                 ifelse_scalar(prob_str<=1-alpha/2, 0, -1));
+                                  ifelse_scalar(prob_str<=1-alpha/2, 0, -1));
   double flag_mr = ifelse_scalar(prob_mr < alpha/2, 1,
                                  ifelse_scalar(prob_mr<=1-alpha/2, 0, -1));
   double flag_r = ifelse_scalar(prob_r < alpha/2, 1, 
@@ -969,13 +797,13 @@ NumericVector bin_logit_cr_score(vec &fail, mat &Z, IntegerVector &n_prov,
   double flag_m = ifelse_scalar(prob_m < alpha/2, 1, 
                                 ifelse_scalar(prob_m<=1-alpha/2, 0, -1));
   double flag_astr = ifelse_scalar(prob_astr < alpha/2, 1, 
-                                ifelse_scalar(prob_astr<=1-alpha/2, 0, -1));
+                                   ifelse_scalar(prob_astr<=1-alpha/2, 0, -1));
   double flag_amr = ifelse_scalar(prob_amr < alpha/2, 1, 
-                                   ifelse_scalar(prob_amr<=1-alpha/2, 0, -1));
+                                  ifelse_scalar(prob_amr<=1-alpha/2, 0, -1));
   double flag_ar = ifelse_scalar(prob_ar < alpha/2, 1,
                                  ifelse_scalar(prob_ar<=1-alpha/2, 0, -1));
   double flag_am = ifelse_scalar(prob_am < alpha/2, 1, 
-                                ifelse_scalar(prob_am<=1-alpha/2, 0, -1));
+                                 ifelse_scalar(prob_am<=1-alpha/2, 0, -1));
   // p-value
   double pval_str = 2*min(prob_str, 1-prob_str);
   double pval_mr = 2*min(prob_mr, 1-prob_mr);
@@ -985,7 +813,7 @@ NumericVector bin_logit_cr_score(vec &fail, mat &Z, IntegerVector &n_prov,
   double pval_amr = 2*min(prob_amr, 1-prob_amr);
   double pval_ar = 2*min(prob_ar, 1-prob_ar);
   double pval_am = 2*min(prob_am, 1-prob_am);
-
+  
   NumericVector res = NumericVector::create(_["stat.strobust"]=stat_str);
   res.push_back(stat_mr, "stat.modrobust");
   res.push_back(stat_r, "stat.robust");
@@ -1020,9 +848,9 @@ NumericVector bin_logit_cr_score(vec &fail, mat &Z, IntegerVector &n_prov,
 
 // [[Rcpp::export]]
 List bin_logit_cr_wald(vec &fail, mat &Z, IntegerVector &n_prov, 
-                                 List n_prov_pat, vec &time, vec gamma, vec eta, 
-                                 vec beta, double alpha=0.05) {
-
+                       List n_prov_pat, vec &time, vec gamma, vec eta, 
+                       vec beta, double alpha=0.05) {
+  
   double gamma_med = median(gamma);
   unsigned int m = gamma.n_elem, n = Z.n_rows; // prov/sample count
   unsigned int p = beta.n_elem, tau = eta.n_elem; // covar/time count
@@ -1632,3 +1460,343 @@ List bin_cloglog_cr(vec &fail, mat &Z, IntegerVector &n_prov, vec &time,
                           _["SRR"]=obs_prov/exp_prov);
   return ret;
 }
+
+vec rep(vec &x, vec &each) {
+  vec x_rep(sum(each));
+  int ind = 0, m = x.n_elem;
+  for (int i = 0; i < m; i++) {
+    x_rep.subvec(ind,ind+each(i)-1) = x(i) * ones(each(i));
+    ind += each(i);
+  }
+  return x_rep;
+}
+
+void ind2uppsub(unsigned int index, unsigned int dim, unsigned int &row, unsigned int &col) {
+  row = 0, col = dim-1;
+  unsigned int n = dim*(dim-1)/2 - (dim-row)*(dim-row-1)/2 + col;
+  while (index > n) {
+    ++row;
+    n = dim*(dim-1)/2 - (dim-row)*(dim-row-1)/2 + col;
+  }
+  while (index < n) {
+    --col;
+    --n;
+  }
+}
+
+mat info_beta_omp(const mat &Z, const vec &pq, const int &threads) {
+  omp_set_num_threads(threads);
+  unsigned int p = Z.n_cols;
+  unsigned int loops = p * (1 + p) / 2;
+  mat output(p, p);
+#pragma omp parallel for schedule(static)
+  for (unsigned int i = 0; i < loops; i++) {
+    unsigned int r, c;
+    ind2uppsub(i, p, r, c);
+    output(r,c) = dot(Z.col(r), Z.col(c)%pq);
+    output(c,r) = output(r,c);
+  }
+  return(output);
+}
+
+double Loglkd(const vec &Y, const vec &Z_beta, const vec &gamma_obs) {
+  return sum((gamma_obs+Z_beta)%Y-log(1+exp(gamma_obs+Z_beta)));
+}
+
+// [[Rcpp::export]]
+List logis_BIN_fe_prov(vec &Y, mat &Z, vec &n_prov, vec gamma, vec beta, 
+                       int parallel=1, int threads=1, double tol=1e-8, int max_iter=10000, double bound=10.0) {
+  
+  int iter = 0, n = Z.n_rows, m = n_prov.n_elem, ind;
+  vec gamma_obs(n);
+  double crit = 100.0; 
+  cout << "Implementing BIN (Rcpp) ..." << endl;
+  
+  double loglkd = Loglkd(Y, Z * beta, rep(gamma, n_prov)), d_loglkd, v, lambda, s = 0.01, t = 0.6;
+  vec gamma_obs_tmp(n), gamma_tmp(m), beta_tmp(Z.n_cols);
+  while (iter < max_iter) {
+    if (crit < tol) {
+      break;
+    }
+    iter++;
+    gamma_obs = rep(gamma, n_prov);
+    vec Z_beta = Z * beta;
+    vec p = 1 / (1 + exp(-gamma_obs-Z_beta));
+    vec Yp = Y - p, pq = p % (1-p);
+    vec score_gamma(m), info_gamma_inv(m);
+    mat info_betagamma(Z.n_cols,m);
+    ind = 0;
+    for (int i = 0; i < m; i++) {
+      score_gamma(i) = sum(Yp(span(ind,ind+n_prov(i)-1)));
+      info_gamma_inv(i) = 1 / sum(pq(span(ind,ind+n_prov(i)-1)));
+      info_betagamma.col(i) = 
+        sum(Z.rows(ind,ind+n_prov(i)-1).each_col()%(p.subvec(ind,ind+n_prov(i)-1)%(1-p.subvec(ind,ind+n_prov(i)-1)))).t();
+      ind += n_prov(i);
+    }
+    vec score_beta = Z.t() * Yp;
+    mat info_beta(Z.n_cols, Z.n_cols);
+    if (parallel==1) { // parallel
+      info_beta = info_beta_omp(Z, pq, threads); // omp
+    } else if (parallel==0) { // serial
+      info_beta = Z.t() * (Z.each_col()%pq);
+    }
+    mat mat_tmp1 = trans(info_betagamma.each_row()%info_gamma_inv.t()); 
+    mat schur_inv = inv_sympd(info_beta-mat_tmp1.t()*info_betagamma.t());
+    mat mat_tmp2 = mat_tmp1*schur_inv;
+    vec d_gamma = info_gamma_inv%score_gamma + mat_tmp2*(mat_tmp1.t()*score_gamma-score_beta);
+    vec d_beta = schur_inv*score_beta - mat_tmp2.t()*score_gamma;
+    v = 1.0; // initialize step size
+    gamma_tmp = gamma + v * d_gamma;
+    gamma_obs_tmp = rep(gamma_tmp, n_prov);
+    vec Z_beta_tmp = Z * (beta+v*d_beta);
+    d_loglkd = Loglkd(Y, Z_beta_tmp, gamma_obs_tmp) - loglkd;
+    lambda = dot(score_gamma, d_gamma) + dot(score_beta, d_beta);
+    while (d_loglkd < s*v*lambda) {
+      v = t*v;
+      gamma_tmp = gamma + v * d_gamma;
+      gamma_obs_tmp = rep(gamma_tmp, n_prov);
+      Z_beta_tmp = Z * (beta+v*d_beta);
+      d_loglkd = Loglkd(Y, Z_beta_tmp, gamma_obs_tmp) - loglkd;
+    }
+    gamma += v * d_gamma;
+    gamma = clamp(gamma, median(gamma)-bound, median(gamma)+bound);
+    beta += v * d_beta;
+    loglkd += d_loglkd;
+    crit = norm(v*d_beta, "inf");
+    cout << "Iter " << iter << ": running diff = " << scientific << setprecision(5) << crit << ";";
+    cout << " loglkd = " << scientific << setprecision(5) << loglkd << ";" << endl;
+  }
+  cout << "BIN (Rcpp) converged after " << iter << " iterations!" << endl;
+  List ret = List::create(_["gamma"]=gamma, _["beta"]=beta);
+  return ret;
+}
+
+/*** R
+fe.data.prep <- function(data, Y.char, Z.char, prov.char, cutoff=10, check=TRUE) {
+  #       data: a data frame including response, provider ID, and  
+  #             covariates, with missing values imputed
+  #     Y.char: a character string as name of response variable
+  #     Z.char: a vector of character strings as names of covariates
+  #  prov.char: a character string as name of variable consisting of provider IDs
+  #     cutoff: an integer as cutoff of provider size with 10 as default
+  #      check: a Boolean (default TRUE) indicating whether checks are needed
+  
+  if (check) {
+    ## check absence of variables
+    message("Checking absence of variables ... ")
+    Y.ind <- match(Y.char, names(data))
+    if (is.na(Y.ind)) {
+      stop(paste("Response variable '", Y.char, "' NOT found!", sep=""),call.=F)
+    }
+    Z.ind <- match(Z.char, names(data))
+    if (sum(is.na(Z.ind)) > 0) {
+      stop(paste("Covariate(s) '", paste(Z.char[is.na(Z.ind)], collapse="', '"), "' NOT found!", sep=""),call.=F)
+    }
+    prov.ind <- match(prov.char, names(data))
+    if (is.na(prov.ind)) {
+      stop(paste("Provider ID '", prov.char, "' NOT found!", sep=""),call.=F)
+    }
+    message("Checking absence of variables completed!")
+    
+    ## check missingness of variables
+    message("Checking missingness of variables ... ")
+    if (sum(complete.cases(data[,c(Y.char,Z.char,prov.char)]))==NROW(data)) {
+      message("Missing values NOT found. Checking missingness of variables completed!")
+    } else {
+      check.na <- function(name) {
+        if (sum(is.na(data[,name])) > 0) {
+          warning(sum(is.na(data[,name]))," out of ",NROW(data[,name])," in '",name,"' missing!",immediate.=T,call.=F)
+        }
+      }
+      invisible(sapply(c(Y.char,Z.char,prov.char), check.na))
+      missingness <- (1 - sum(complete.cases(data[,c(Y.char,Z.char,prov.char)])) / NROW(data)) * 100
+      stop(paste(round(missingness,2), "% of all observations are missing!",sep=""),call.=F)
+    }
+    ## check variation in covariates
+    message("Checking variation in covariates ... ")
+    nzv <- caret::nearZeroVar(data[,Z.char], saveMetrics=T)
+    if (sum(nzv$zeroVar==T) > 0) {
+      stop("Covariate(s) '", paste(row.names(nzv[nzv$zeroVar==T,]), collapse="', '"),
+           "' with zero variance(s)!", call.=F)
+    } else if (sum(nzv$nzv==T) > 0) {
+      warning("Covariate(s) '",paste(row.names(nzv[nzv$nzv==T,]), collapse="', '"),
+              "' with near zero variance(s)!",immediate.=T,call.=F)
+    }
+    message("Checking variation in covariates completed!")
+    ## check correlation
+    message("Checking pairwise correlation among covariates ... ")
+    cor <- cor(data[,Z.char])
+    threshold.cor <- 0.9
+    if (sum(abs(cor[upper.tri(cor)])>threshold.cor) > 0) {
+      cor[lower.tri(cor,diag=T)] <- 0
+      ind <- which(abs(cor)>threshold.cor)
+      pairs <- sapply(ind, function(ind) c(rownames(cor)[ind%%NROW(cor)], 
+                                           colnames(cor)[ind%/%NROW(cor)+1]))
+      warning("The following ", NCOL(pairs), 
+              " pair(s) of covariates are highly correlated (correlation > ",
+              threshold.cor,"): ", immediate.=T, call.=F)
+      invisible(apply(pairs,2,function(col) message('("',paste(col, collapse='", "'),'")')))
+    }
+    message("Checking pairwise correlation among covariates completed!")
+    ## check VIF
+    message("Checking VIF of covariates ... ")
+    m.lm <- lm(as.formula(paste(Y.char,"~",paste(Z.char, collapse="+"))), data=data)
+    vif <- olsrr::ols_vif_tol(m.lm)
+    if(sum(vif$VIF >= 10) > 0){
+      warning("Covariate(s) '",
+              paste(as.data.frame(vif)[vif$VIF>=10,"Variables"], collapse="', '"),
+              "' with serious multicollinearity!",immediate.=T,call.=F)
+    }
+    message("Checking VIF of covariates completed!")
+  }
+  
+  data <- data[order(factor(data[,prov.char])),] # sort data by provider ID
+  prov.size <- as.integer(table(data[,prov.char])) # provider sizes
+  prov.size.long <- rep(prov.size,prov.size) # provider sizes assigned to patients
+  data$included <- 1 * (prov.size.long > cutoff) # create variable 'included' as an indicator
+  warning(sum(prov.size<=cutoff)," out of ",length(prov.size),
+          " providers considered small and filtered out!",immediate.=T,call.=F)
+  prov.list <- unique(data[data$included==1,prov.char])   # a reduced list of provider IDs
+  prov.no.readm <-      # providers with no readmission within 30 days
+    prov.list[sapply(split(data[data$included==1,Y.char], factor(data[data$included==1,prov.char])),sum)==0]
+  data$no.readm <- 0
+  data$no.readm[data[,prov.char]%in%c(prov.no.readm)] <- 1
+  message(paste(length(prov.no.readm),"out of",length(prov.list),
+                "remaining providers with no readmission within 30 days."))
+  prov.all.readm <-     # providers with all readmissions within 30 days
+    prov.list[sapply(split(1-data[data$included==1,Y.char],factor(data[data$included==1,prov.char])),sum)==0]
+  data$all.readm <- 0
+  data$all.readm[data[,prov.char]%in%c(prov.all.readm)] <- 1
+  message(paste(length(prov.all.readm),"out of",length(prov.list),
+                "remaining providers with all readmissions within 30 days."))
+  message(paste0("After screening, ", round(sum(data[data$included==1,Y.char])/length(data[data$included==1,Y.char])*100,2),
+                 "% of all discharges were readmitted within 30 days."))
+  return(data) 
+  #       data: a data frame sorted by provider IDs with additional variables 'included', 'no.readm', 'all.readm'
+  #             and missing values imputed
+  
+}  # end of fe.data.prep
+
+logis.BIN.fe.prov <- function(data, Y.char, Z.char, prov.char, tol=1e-5, backtrack=FALSE, null="median", Rcpp=TRUE, AUC=FALSE){
+  #      data: a data frame sorted by providers with additional variable 'included',
+  #            with missing values imputed
+  #    Y.char: a character string as name of response variable
+  #    Z.char: a vector of character strings as names of covariates
+  # prov.char: a character string as name of variable consisting of provider IDs
+  #       tol: a small positive number specifying stopping criterion of Newton-Raphson algorithm
+  # backtrack: a boolean indicating whether backtracking line search is implemented, defaulting to FALSE
+  #      null: a character string or real number specifying null hypotheses of fixed provider effects
+  #      Rcpp: a Boolean indicating whether the Rcpp function 'logis_fe_prov' is used, default true
+  
+  if (!is.logical(backtrack)) stop("Argument 'backtrack' NOT as required!")
+  data <- data[data$included==1,]
+  n.prov <- sapply(split(data[, Y.char], data[, prov.char]), length) # provider-specific number of discharges
+  n.readm.prov <- sapply(split(data[, Y.char], data[, prov.char]), sum) # provider-specific number of readmissions
+  bound <- 10.0; max.iter <- 10000
+  Z <- as.matrix(data[,Z.char])
+  gamma.prov <- rep(log(mean(data[,Y.char])/(1-mean(data[,Y.char]))), length(n.prov))
+  beta <- rep(0, NCOL(Z))
+  if (Rcpp) {
+    ls <- logis_BIN_fe_prov(as.matrix(data[,Y.char]),Z,n.prov,gamma.prov,beta,0,1,tol,max.iter,bound)
+    gamma.prov <- as.numeric(ls$gamma); beta <- as.numeric(ls$beta)
+  } else {
+    iter <- 0
+    beta.crit <- 100 # initialize stop criterion
+    message("Implementing Cost-Efficient Newton-Raphson (CENR) algorithm for fixed provider effects model ...")
+    if (backtrack) {
+      s <- 0.01; t <- 0.6 # initialize parameters for backtracking line search
+      Loglkd <- function(gamma.obs, beta) {
+        sum((gamma.obs+Z%*%beta)*data[,Y.char]-log(1+exp(gamma.obs+Z%*%beta)))
+      }
+      loglkd <- Loglkd(rep(gamma.prov, n.prov), beta)
+      while (iter<=max.iter & beta.crit>=tol) {
+        iter <- iter + 1
+        gamma.obs <- rep(gamma.prov, n.prov)
+        p <- c(plogis(gamma.obs+Z%*%beta))
+        q <- p*(1-p)
+        score.gamma <- sapply(split(data[,Y.char]-p, data[,prov.char]), sum)
+        score.beta <- t(Z)%*%(data[,Y.char]-p)
+        info.gamma.inv <- 1/sapply(split(q, data[,prov.char]),sum)
+        info.betagamma <- sapply(by(q*Z,data[,prov.char],identity),colSums)
+        info.beta <- t(Z)%*%(q*Z)
+        mat.tmp1 <- info.gamma.inv*t(info.betagamma)
+        schur.inv <- solve(info.beta-info.betagamma%*%mat.tmp1)
+        mat.tmp2 <- mat.tmp1%*%schur.inv
+        d.gamma.prov <- info.gamma.inv*score.gamma + 
+          mat.tmp2%*%(t(mat.tmp1)%*%score.gamma-score.beta)
+        d.beta <- -t(mat.tmp2)%*%score.gamma+schur.inv%*%score.beta
+        v <- 1 # initialize step size
+        d.loglkd <- Loglkd(rep(gamma.prov+v*d.gamma.prov, n.prov), beta+v*d.beta) - loglkd
+        lambda <- c(score.gamma,score.beta)%*%c(d.gamma.prov,d.beta)
+        while (d.loglkd < s*v*lambda) {
+          v <- t * v
+          d.loglkd <- Loglkd(rep(gamma.prov+v*d.gamma.prov, n.prov), beta+v*d.beta) - loglkd
+        }
+        gamma.prov <- gamma.prov + v * d.gamma.prov
+        gamma.prov <- pmin(pmax(gamma.prov, median(gamma.prov)-bound), median(gamma.prov)+bound)
+        beta.new <- beta + v * d.beta
+        beta.crit <- norm(matrix(beta-beta.new),"I") # stopping criterion
+        beta <- beta.new
+        loglkd <- loglkd + d.loglkd
+        cat(paste0("Iter ",iter,": Inf norm of running diff in est reg parm is ",
+                   formatC(beta.crit,digits=3,format="e"),";\n"))
+      }
+    } else {
+      while (iter<=max.iter & beta.crit>=tol) {
+        iter <- iter + 1
+        cat(paste0("\n Iter ",iter,":"))
+        gamma.obs <- rep(gamma.prov, n.prov)
+        p <- c(plogis(gamma.obs+Z%*%beta))
+        score.gamma <- sapply(split(data[,Y.char]-p, data[,prov.char]), sum)
+        score.beta <- t(Z)%*%(data[,Y.char]-p)
+        info.gamma.inv <- 1/sapply(split(p*(1-p), data[,prov.char]),sum)
+        info.betagamma <- sapply(by(p*(1-p)*Z,data[,prov.char],identity),colSums)
+        info.beta <- t(Z)%*%(p*(1-p)*Z)
+        schur.inv <- solve(info.beta-info.betagamma%*%(info.gamma.inv*t(info.betagamma)))
+        mat.tmp1 <- info.gamma.inv*t(info.betagamma)
+        mat.tmp2 <- mat.tmp1%*%schur.inv
+        gamma.prov <- gamma.prov +
+          info.gamma.inv*score.gamma+mat.tmp2%*%(t(mat.tmp1)%*%score.gamma-score.beta)
+        gamma.prov <- pmin(pmax(gamma.prov, median(gamma.prov)-bound), median(gamma.prov)+bound)
+        beta.new <- beta - t(mat.tmp2)%*%score.gamma+schur.inv%*%score.beta
+        beta.crit <- norm(matrix(beta-beta.new),"I") # stopping criterion
+        beta <- beta.new
+        cat(paste0(" Inf norm of running diff in est reg parm is ",formatC(beta.crit,digits=3,format="e"),";"))
+      }
+    }
+    message("\n CENR algorithm converged after ",iter," iterations!")
+  }
+  gamma.obs <- rep(gamma.prov, n.prov)
+  gamma.null <- ifelse(null=="median", median(gamma.prov),
+                       ifelse(class(null)=="numeric", null[1],
+                              stop("Argument 'null' NOT as required!",call.=F)))
+  Exp <- as.numeric(plogis(gamma.null+Z%*%beta)) # expected prob of readm within 30 days of discharge under null
+  Pred <- as.numeric(plogis(gamma.obs+Z%*%beta))
+  df.prov <- data.frame(Obs=sapply(split(data[,Y.char],data[,prov.char]),sum),
+                        Exp=sapply(split(Exp,data[,prov.char]),sum))
+  df.prov$SRR <- df.prov$Obs / df.prov$Exp
+  df.prov$gamma <- gamma.prov
+  neg2Loglkd <- -2*sum((gamma.obs+Z%*%beta)*data[,Y.char]-log(1+exp(gamma.obs+Z%*%beta)))
+  AIC <- neg2Loglkd + 2 * (length(gamma.prov)+length(beta))
+  BIC <- neg2Loglkd + log(nrow(data)) * (length(gamma.prov)+length(beta))
+  gamma.prov[n.readm.prov==n.prov] <- Inf; gamma.prov[n.readm.prov==0] <- -Inf
+  if (AUC) {
+    AUC <- pROC::auc(data[,Y.char], Pred)
+    return(list(beta=beta, Obs=data[, Y.char], Exp=Exp, df.prov=df.prov,
+                neg2Loglkd=neg2Loglkd, AIC=AIC, BIC=BIC, AUC=AUC[1]))
+  } else {
+    return(list(beta=beta, Obs=data[, Y.char], Exp=Exp, df.prov=df.prov,
+                neg2Loglkd=neg2Loglkd, AIC=AIC, BIC=BIC))
+  }
+  #       beta: a vector of fixed effect estimates
+  #        Obs: a vector of responses for included providers
+  #        Exp: a vector of expected probs of readmission within 30 days of discharge
+  #    df.prov: a data frame of provider-level number of observed number of readmissions within 30 days
+  #             expected number of readmissions within 30 days, a vector of SRRs, and a vector of
+  #             provider effect estimates for included providers (considered as a fixed effect)
+  # neg2Loglkd: minus two times log likelihood
+  #        AIC: Akaike info criterion
+  #        BIC: Bayesian info criterion
+  #        AUC: area under the ROC curve
+} # end of logis.CENR.fe.prov
+*/
